@@ -1,12 +1,15 @@
 import depthai as dai
 import cv2
 import blobconverter
+import pdb
+import pyvirtualcam
 
 # Stream MJPEG from the device, useful for saving / forwarding stream
-MJPEG = False
+MJPEG = True
 
 # Constants
 SCENE_SIZE = (1920, 1080)
+VID_SIZE = (3840, 2160)
 
 # Start defining a pipeline
 pipeline = dai.Pipeline()
@@ -27,6 +30,19 @@ mobilenet.setBlobPath(blobconverter.from_zoo(name="face-detection-retail-0004", 
 mobilenet.setConfidenceThreshold(0.7)
 cam.preview.link(mobilenet.input)
 
+xout_nn = pipeline.create(dai.node.XLinkOut)
+xout_nn.setStreamName("nn")
+mobilenet.out.link(xout_nn.input)
+
+camControlIn = pipeline.createXLinkIn()
+camControlIn.setStreamName('camControl')
+camControlIn.out.link(cam.inputControl)
+
+def asControl(roi):
+    camControl = dai.CameraControl()
+    camControl.setAutoExposureRegion(*roi)
+    return camControl
+
 # Script node
 script = pipeline.create(dai.node.Script)
 mobilenet.out.link(script.inputs['dets'])
@@ -35,7 +51,8 @@ ORIGINAL_SIZE = (3840, 2160) # 4K
 SCENE_SIZE = (1920, 1080) # 1080P
 x_arr = []
 y_arr = []
-AVG_MAX_NUM=7
+AVG_MAX_NUM=50
+Y_OFFSET = 0
 limits = [SCENE_SIZE[0] // 2, SCENE_SIZE[1] // 2] # xmin and ymin limits
 limits.append(ORIGINAL_SIZE[0] - limits[0]) # xmax limit
 limits.append(ORIGINAL_SIZE[1] - limits[1]) # ymax limit
@@ -65,10 +82,17 @@ while True:
     dets = node.io['dets'].get().detections
     if len(dets) == 0: continue
 
-    coords = dets[0] # take first
+    # follow only the biggest head on the screen
+    max_area = 0
+    for det in dets:
+        area = (det.xmax-det.xmin) * (det.ymax-det.ymin)
+        if area > max_area:
+            coords = det
+            max_area = area 
+    
     # Get detection center
     x = (coords.xmin + coords.xmax) / 2 * ORIGINAL_SIZE[0]
-    y = (coords.ymin + coords.ymax) / 2 * ORIGINAL_SIZE[1] + 100
+    y = (coords.ymin + coords.ymax) / 2 * ORIGINAL_SIZE[1]  + Y_OFFSET
 
     x_avg, y_avg = average_filter(x,y)
 
@@ -87,39 +111,33 @@ if MJPEG:
 script.outputs['cfg'].link(crop_manip.inputConfig)
 cam.isp.link(crop_manip.inputImage)
 
-xout = pipeline.create(dai.node.XLinkOut)
-xout.setStreamName('1080P')
-if MJPEG:
-    videoEnc = pipeline.create(dai.node.VideoEncoder)
-    videoEnc.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.MJPEG)
-    crop_manip.out.link(videoEnc.input)
-    # Link
-    videoEnc.bitstream.link(xout.input)
-else:
-    crop_manip.out.link(xout.input)
+uvc = pipeline.createUVC()
+
+crop_manip.out.link(uvc.input)
 
 xoutFull = pipeline.create(dai.node.XLinkOut)
 xoutFull.setStreamName('full')
 cam.preview.link(xoutFull.input)
 
+
+
 with dai.Device(pipeline) as device:
-    qHq = device.getOutputQueue(name='1080P')
     qFull = device.getOutputQueue(name='full')
+    q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
+    qControl = device.getInputQueue(name="camControl")
+    FRAME_NUM = 0
     # Main loop
     while True:
-        if qHq.has():
-            frameIn = qHq.get()
-            if MJPEG:
-                # Instead of decoding, you could also save the MJPEG or stream it elsewhere. For this demo,
-                # we just want to display the stream, so we need to decode it.
-                frame = cv2.imdecode(frameIn.getData(), cv2.IMREAD_COLOR)
-            else:
-                frame = frameIn.getCvFrame()
+        
+        dets = q_nn.get().detections
+        if len(dets) > 0:
+            qControl = device.getInputQueue(name="camControl")
+            roi = (max(int(i),0) for i in (VID_SIZE[0]*dets[0].xmin + 40, VID_SIZE[1]*dets[0].ymin + 40, VID_SIZE[0]*(dets[0].xmax-dets[0].xmin)-40, VID_SIZE[1]*(dets[0].ymax-dets[0].ymin)- 40 )) # 4k
+            if FRAME_NUM == 0:
+                qControl.send(asControl(roi))
+        FRAME_NUM +=1
+        FRAME_NUM = FRAME_NUM % 10
 
-            # Remove this line if you would like to see 1080P (not downscaled)
-            frame = cv2.resize(frame, (640,360))
-
-            cv2.imshow('Lossless zoom 1080P', frame)
         if qFull.has():
             cv2.imshow('Preview', qFull.get().getCvFrame())
         # Update GUI and handle keypresses

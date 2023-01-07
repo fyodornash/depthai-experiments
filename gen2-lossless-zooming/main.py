@@ -1,8 +1,6 @@
 import depthai as dai
 import cv2
 import blobconverter
-import pdb
-import pyvirtualcam
 
 # Stream MJPEG from the device, useful for saving / forwarding stream
 MJPEG = True
@@ -110,12 +108,34 @@ if MJPEG:
     crop_manip.initialConfig.setFrameType(dai.RawImgFrame.Type.NV12)
 script.outputs['cfg'].link(crop_manip.inputConfig)
 cam.isp.link(crop_manip.inputImage)
+outFull = pipeline.create(dai.node.XLinkOut)
+xoutFull.setStreamName('full')
+cam.preview.link(xoutFull.input)
 
-uvc = pipeline.createUVC()
 
-crop_manip.out.link(uvc.input)
 
-xoutFull = pipeline.create(dai.node.XLinkOut)
+with dai.Device(pipeline) as device:
+    qFull = device.getOutputQueue(name='full')
+    q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
+    qControl = device.getInputQueue(name="camControl")
+    FRAME_NUM = 0
+    # Main loop
+    while True:
+        
+        dets = q_nn.get().detections
+        if len(dets) > 0:
+            qControl = device.getInputQueue(name="camControl")
+            roi = (max(int(i),0) for i in (VID_SIZE[0]*dets[0].xmin + 40, VID_SIZE[1]*dets[0].ymin + 40, VID_SIZE[0]*(dets[0].xmax-dets[0].xmin)-40, VID_SIZE[1]*(dets[0].ymax-dets[0].ymin)- 40 )) # 4k
+            if FRAME_NUM == 0:
+                qControl.send(asControl(roi))
+        FRAME_NUM +=1
+        FRAME_NUM = FRAME_NUM % 10
+
+        if qFull.has():
+            cv2.imshow('Preview', qFull.get().getCvFrame())
+        # Update GUI and handle keypresses
+        if cv2.waitKey(1) == ord('q'):
+            breakoutFull = pipeline.create(dai.node.XLinkOut)
 xoutFull.setStreamName('full')
 cam.preview.link(xoutFull.input)
 

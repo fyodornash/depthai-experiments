@@ -1,6 +1,8 @@
 import depthai as dai
 import cv2
 import blobconverter
+import pdb
+import pyvirtualcam
 
 # Stream MJPEG from the device, useful for saving / forwarding stream
 MJPEG = True
@@ -80,14 +82,7 @@ while True:
     dets = node.io['dets'].get().detections
     if len(dets) == 0: continue
 
-    # follow only the biggest head on the screen
-    max_area = 0
-    for det in dets:
-        area = (det.xmax-det.xmin) * (det.ymax-det.ymin)
-        if area > max_area:
-            coords = det
-            max_area = area 
-    
+    coords = dets[0] # take first
     # Get detection center
     x = (coords.xmin + coords.xmax) / 2 * ORIGINAL_SIZE[0]
     y = (coords.ymin + coords.ymax) / 2 * ORIGINAL_SIZE[1]  + Y_OFFSET
@@ -109,16 +104,27 @@ if MJPEG:
 script.outputs['cfg'].link(crop_manip.inputConfig)
 cam.isp.link(crop_manip.inputImage)
 
-uvc = pipeline.createUVC()
-crop_manip.out.link(uvc.input)
+xout = pipeline.create(dai.node.XLinkOut)
+xout.setStreamName('1080P')
+if MJPEG:
+    videoEnc = pipeline.create(dai.node.VideoEncoder)
+    videoEnc.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.MJPEG)
+    crop_manip.out.link(videoEnc.input)
+    # Link
+    videoEnc.bitstream.link(xout.input)
+else:
+    crop_manip.out.link(xout.input)
 
 xoutFull = pipeline.create(dai.node.XLinkOut)
 xoutFull.setStreamName('full')
 cam.preview.link(xoutFull.input)
 
+# uvc = pipeline.createUVC()
+# pdb.set_trace()
 
 
-with dai.Device(pipeline) as device:
+with dai.Device(pipeline) as device, pyvirtualcam.Camera(width=1920, height=1080, fps=20) as uvc:
+    qHq = device.getOutputQueue(name='1080P')
     qFull = device.getOutputQueue(name='full')
     q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
     qControl = device.getInputQueue(name="camControl")
@@ -126,42 +132,33 @@ with dai.Device(pipeline) as device:
     # Main loop
     while True:
         
-        dets = q_nn.get().detections
-        if len(dets) > 0:
-            qControl = device.getInputQueue(name="camControl")
-            roi = (max(int(i),0) for i in (VID_SIZE[0]*dets[0].xmin + 40, VID_SIZE[1]*dets[0].ymin + 40, VID_SIZE[0]*(dets[0].xmax-dets[0].xmin)-40, VID_SIZE[1]*(dets[0].ymax-dets[0].ymin)- 40 )) # 4k
-            if FRAME_NUM == 0:
-                qControl.send(asControl(roi))
-        FRAME_NUM +=1
-        FRAME_NUM = FRAME_NUM % 10
+        if qHq.has():
+            frameIn = qHq.get()
+            # pdb.set_trace()
+            if MJPEG:
+                # Instead of decoding, you could also save the MJPEG or stream it elsewhere. For this demo,
+                # we just want to display the stream, so we need to decode it.
+                frame = cv2.imdecode(frameIn.getData(), cv2.IMREAD_COLOR)
+                frame_uvc = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame = frameIn.getCvFrame()
+            uvc.send(frame_uvc)
+            # Remove this line if you would like to see 1080P (not downscaled)
+            # frame = cv2.resize(frame, (640,360))
 
-        if qFull.has():
-            cv2.imshow('Preview', qFull.get().getCvFrame())
-        # Update GUI and handle keypresses
-        if cv2.waitKey(1) == ord('q'):
-            breakoutFull = pipeline.create(dai.node.XLinkOut)
-xoutFull.setStreamName('full')
-cam.preview.link(xoutFull.input)
-
-
-
-with dai.Device(pipeline) as device:
-    qFull = device.getOutputQueue(name='full')
-    q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
-    qControl = device.getInputQueue(name="camControl")
-    FRAME_NUM = 0
-    # Main loop
-    while True:
+            # cv2.imshow('Lossless zoom 1080P', frame)
         
         dets = q_nn.get().detections
         if len(dets) > 0:
             qControl = device.getInputQueue(name="camControl")
-            roi = (max(int(i),0) for i in (VID_SIZE[0]*dets[0].xmin + 40, VID_SIZE[1]*dets[0].ymin + 40, VID_SIZE[0]*(dets[0].xmax-dets[0].xmin)-40, VID_SIZE[1]*(dets[0].ymax-dets[0].ymin)- 40 )) # 4k
+            roi = (int(i) for i in (VID_SIZE[0]*dets[0].xmin, VID_SIZE[1]*dets[0].ymin, VID_SIZE[0]*(dets[0].xmax-dets[0].xmin), VID_SIZE[1]*(dets[0].ymax-dets[0].ymin))) # 4k
             if FRAME_NUM == 0:
                 qControl.send(asControl(roi))
         FRAME_NUM +=1
-        FRAME_NUM = FRAME_NUM % 10
+        FRAME_NUM = FRAME_NUM % 20
 
+        # pdb.set_trace()
+        # print(in_nn.detections)
         if qFull.has():
             cv2.imshow('Preview', qFull.get().getCvFrame())
         # Update GUI and handle keypresses
